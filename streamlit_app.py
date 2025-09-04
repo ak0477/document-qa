@@ -1,6 +1,14 @@
 import streamlit as st
 from openai import OpenAI
 
+# create multi page
+lab1_page = st.Page("HW1.py", title = "Lab 1", icon = ":material/thumb_up:")
+lab2_page = st.Page("lab2.py", title = "Lab 2", icon = ":material/thumb_up:")
+
+pg = st.navigation([ lab1_page, lab2_page])
+st.set_page_config(page_title= "Main Lab", page_icon= ":material/home:")
+pg.run()
+
 # Show title and description.
 st.title("My Document question answering")
 st.write(
