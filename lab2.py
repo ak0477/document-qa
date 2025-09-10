@@ -31,10 +31,11 @@ st.write(
     "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
 )
 
+add_selectbox = st.sidebar.selectbox("how would you like to summarize?", ("100 words", "2 paragraphs", "5 bullet points"))
 # Ask user for their OpenAI API key via `st.text_input`.
 # Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
 # via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
+openai_api_key = st.secrets["openai"]['api_key']
 if not openai_api_key:
     st.info("Please add your OpenAI API key to continue.", icon="🗝️")
 else:
@@ -84,6 +85,8 @@ else:
             messages=messages,
             stream=True,
         )
-
+        
+        if st.checkbox("Use Advanced Model"):
+            model == "gpt-4.1"
         # Stream the response to the app using `st.write_stream`.
         st.write_stream(stream)
