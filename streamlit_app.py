@@ -4,8 +4,9 @@ from openai import OpenAI
 # create multi page
 lab1_page = st.Page("HW1.py", title = "Lab 1", icon = ":material/thumb_up:")
 lab2_page = st.Page("lab2.py", title = "Lab 2", icon = ":material/thumb_up:")
+lab3_page = st.Page("lab3.py", title = "Lab 3", icon = ":material/thumb_up:")
 
-pg = st.navigation([ lab1_page, lab2_page])
+pg = st.navigation([ lab1_page, lab2_page, lab3_page])
 st.set_page_config(page_title= "My Labs", page_icon= ":material/home:", layout = 'wide', initial_sidebar_state = "expanded")
 st.title("My Labs")
 pg.run()
