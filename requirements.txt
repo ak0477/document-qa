@@ -4,4 +4,4 @@ anthropic>=0.34
 google-generativeai>=0.7.2
 requests>=2.32
 beautifulsoup4>=4.12
-fitz
+PyMuPDF
