@@ -1,7 +1,7 @@
 streamlit>=1.33
+requests>=2.31.0
+beautifulsoup4>=4.12
 openai>=1.40
 anthropic>=0.34
 google-generativeai>=0.7.2
-requests>=2.31.0
-beautifulsoup4>=4.12
 PyMuPDF
