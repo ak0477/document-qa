@@ -8,3 +8,4 @@ PyMuPDF
 PyPDF2
 pysqlite3-binary
 chromadb
+lxml

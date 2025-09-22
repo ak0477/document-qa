@@ -535,5 +535,6 @@ def page_hw3():
 hw1_page = st.Page(page_hw1, title="HW 1 — Document Q&A", icon=":material/looks_one:")
 hw2_page = st.Page(page_hw2, title="HW 2 — URL Summarizer", icon=":material/looks_two:")
 hw3_page = st.Page(page_hw3, title="HW 3 — URL Chatbot", icon=":material/looks_3:")
-pg = st.navigation([hw1_page, hw2_page, hw3_page])
+hw4_page = st.Page(page_hw4, title="HW 4 — iSchool Chatbot", icon=":material/looks_4:")
+pg = st.navigation([hw1_page, hw2_page, hw3_page, hw4_page])
 pg.run()
