@@ -529,6 +529,30 @@ def page_hw3():
         with st.expander("Response details"):
             st.json(meta)
 
+
+# =========================
+# Page: HW4 — iSchool Chatbot (RAG over HTML)
+# =========================
+def page_hw4():
+    st.title("HW 4 — iSchool Chatbot (RAG over HTML)")
+
+    # Locate HW4.py relative to this app.py file
+    hw4_path = os.path.join(os.path.dirname(__file__), "HWs", "HW4.py")
+    if not os.path.exists(hw4_path):
+        st.error("HW4.py not found at ./HWs/HW4.py. Please add the file from your HW4 implementation.")
+        return
+
+    # Import and execute HW4.py so its Streamlit code renders on this page
+    try:
+        spec = importlib.util.spec_from_file_location("hw4_module", hw4_path)
+        hw4_mod = importlib.util.module_from_spec(spec)
+        sys.modules["hw4_module"] = hw4_mod
+        spec.loader.exec_module(hw4_mod)
+        # Note: If your HW4.py exposes a function like render(), you could call it here instead.
+    except Exception as e:
+        st.error("Failed to load HW4 page:")
+        st.exception(e)
+
 # =========================
 # Navigation
 # =========================
