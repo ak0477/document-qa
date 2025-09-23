@@ -1,11 +1,3 @@
-# HW4.py — Streamlit page: iSchool Student Orgs Chatbot (RAG over HTML)
-# ---------------------------------------------------------------
-# Chunking: For each HTML doc, we create exactly 2 mini-docs 
-# Method: split by character count near a paragraph boundary.
-# Why this method? It's simple, deterministic, guarantees 2 chunks, and keeps each
-# chunk large enough for semantic retrieval while avoiding token limits and preserving
-# coherence at paragraph boundaries better than naive mid-string splits.
-
 import os
 import re
 import sys
@@ -14,12 +6,9 @@ from typing import List, Dict, Tuple
 
 import streamlit as st
 from openai import OpenAI
-
-# HTML parsing
 from bs4 import BeautifulSoup
 
 # --- Make Chroma use pysqlite3 (needed on Streamlit Cloud / Python 3.12) ---
-# If you see "unsupported sqlite3 version", this shim fixes it.
 import pysqlite3  # noqa: F401
 sys.modules['sqlite3'] = pysqlite3
 sys.modules['sqlite3.dbapi2'] = pysqlite3
@@ -29,16 +18,13 @@ import chromadb
 # =========================
 # Configuration
 # =========================
-# Put your provided HTMLs here (unzipped). We will load *.html and *.htm.
-HTML_DIR = "./iSchool_HTMLs"                 # <— copy *all* supplied HTML pages here
-CHROMA_PATH = "./Chroma_HW4"                 # <— persistent vector store folder
+HTML_DIR = "/workspaces/document-qa/iSchool_HTMLs"  # Directory for your HTML files
+CHROMA_PATH = "./Chroma_HW4"  # Persistent vector store folder
 COLLECTION_NAME = "HW4_iSchool_StudentOrgs"
 EMBED_MODEL = "text-embedding-3-small"
 
-# api_key = "sk-..."
 OPENAI_API_KEY = st.secrets["openai"]["api_key"].strip()
 
-# 3 model choices in the sidebar, per HW4
 MODEL_CHOICES = ["gpt-5-mini", "gpt-4o-mini", "gpt-4o"]
 DEFAULT_CHAT_MODEL = MODEL_CHOICES[0]
 
@@ -63,7 +49,7 @@ def read_html_text(path: str) -> str:
             html = f.read()
         soup = BeautifulSoup(html, "html.parser")
 
-        # Remove script/style/head/nav elements to keep actual page content
+        # Remove non-content elements
         for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
             tag.decompose()
 
@@ -89,25 +75,11 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
 # --------- Chunking Strategy (exactly 2 chunks per document) ----------
 def split_on_para_boundaries(text: str) -> List[str]:
     """Split raw text into paragraphs (blank lines as separators)."""
-    # Normalize Windows newlines, then split on blank lines
     text = text.replace("\r\n", "\n")
     paras = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     return paras
 
 def chunk_text_into_two(text: str) -> Tuple[str, str]:
-    """
-    Create exactly TWO chunks per document.
-
-    Method (explained as required):
-    - We split the document into paragraphs.
-    - We compute cumulative character lengths and find the midpoint target (len/2).
-    - We choose a cut position at the paragraph boundary nearest to the midpoint.
-      This preserves semantic coherence better than cutting in the middle of a paragraph
-      and is deterministic and simple (good for HW). It keeps chunks reasonably balanced
-      for embedding-based retrieval.
-
-    If paragraphs are too few/uneven, we fallback to a simple char midpoint split.
-    """
     if not text:
         return ("", "")
     paras = split_on_para_boundaries(text)
@@ -115,7 +87,6 @@ def chunk_text_into_two(text: str) -> Tuple[str, str]:
     if len(paras) >= 2:
         cum = 0
         target = total // 2
-        # Find boundary nearest to target
         cut_index = 0
         for i, p in enumerate(paras):
             cum += len(p) + 2  # +2 for the two newlines we removed
@@ -124,13 +95,8 @@ def chunk_text_into_two(text: str) -> Tuple[str, str]:
                 break
         left = "\n\n".join(paras[:cut_index]).strip()
         right = "\n\n".join(paras[cut_index:]).strip()
-        if not left or not right:
-            # Fallback if something went odd
-            mid = max(1, total // 2)
-            return (text[:mid].strip(), text[mid:].strip())
         return (left, right)
     else:
-        # No clear paragraphs; fallback to midpoint split
         mid = max(1, total // 2)
         return (text[:mid].strip(), text[mid:].strip())
 
@@ -138,27 +104,20 @@ def chunk_text_into_two(text: str) -> Tuple[str, str]:
 # 2) Core function — create/load Chroma once
 # =========================
 def create_or_load_hw4_vectorDB():
-    """
-    Policy for HW4:
-    - If CHROMA_PATH is missing or empty, build the vector DB from HTML docs.
-    - If CHROMA_PATH exists AND contains a collection, **do not** re-ingest; just load.
-
-    Ingestion details:
-    - Use all *.html / *.htm in HTML_DIR
-    - For each file, create exactly TWO chunks (see `chunk_text_into_two`)
-    - Store metadata: {"filename": fname, "source_path": path, "chunk": 1 or 2}
-    - IDs: use "{filename}#chunk{1|2}"
-    """
-    # Decide if we need to build from scratch
+    """Create/load Chroma vector DB."""
     need_build = (not os.path.exists(CHROMA_PATH)) or (os.path.exists(CHROMA_PATH) and not os.listdir(CHROMA_PATH))
 
     chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
     collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
 
+    # Log the number of documents in the collection
+    count = collection.count()
+    st.write(f"Collection has {count} documents.")  # This confirms that the collection is being loaded
+
     if need_build:
         html_paths = list_html_files(HTML_DIR)
         if not html_paths:
-            st.error(f"No HTML files found in {HTML_DIR}. Copy all supplied HTML pages there.")
+            st.error(f"No HTML files found in {HTML_DIR}.")
         else:
             docs: List[str] = []
             ids: List[str] = []
@@ -171,14 +130,13 @@ def create_or_load_hw4_vectorDB():
                 chunk1, chunk2 = chunk_text_into_two(raw)
                 fname = os.path.basename(p)
 
-                # Collect exactly two chunks
                 for idx, chunk in enumerate((chunk1, chunk2), start=1):
-                    if not chunk:
-                        continue
-                    docs.append(chunk)
-                    ids.append(f"{fname}#chunk{idx}")
-                    metadatas.append({"filename": fname, "source_path": p, "chunk": idx})
+                    if chunk:
+                        docs.append(chunk)
+                        ids.append(f"{fname}#chunk{idx}")
+                        metadatas.append({"filename": fname, "source_path": p, "chunk": idx})
 
+            st.write(f"Documents to be added: {len(docs)}")  # Log number of documents to be embedded
             if docs:
                 embs = embed_texts(docs)
                 collection.add(
@@ -187,14 +145,15 @@ def create_or_load_hw4_vectorDB():
                     metadatas=metadatas,
                     embeddings=embs,
                 )
-                st.success(f"Ingested {len(docs)} chunk(s) from {len(html_paths)} HTML file(s) into '{COLLECTION_NAME}'.")
+                st.success(f"Ingested {len(docs)} chunks from {len(html_paths)} HTML files.")
             else:
                 st.error("No readable text extracted from the provided HTML files.")
 
-    # In all cases, keep a handle in session state
+    # Store collection in session state for later use
     st.session_state.HW4_vectorDB = {"client": chroma_client, "collection": collection}
+    return collection
 
-# Call once per app run
+# Initialize the Chroma DB and collection when the app runs
 if "HW4_vectorDB" not in st.session_state:
     create_or_load_hw4_vectorDB()
 
@@ -205,18 +164,30 @@ collection = st.session_state.HW4_vectorDB["collection"]
 # =========================
 def retrieve_context(query: str, k: int = 3):
     """Return top-k doc snippets + metadata for a query using embeddings."""
-    # Try embeddings-based query first; fall back to query_texts for older Chroma
+    # Ensure the collection is available in session state
+    if "HW4_vectorDB" not in st.session_state:
+        st.error("Chroma vector DB is not initialized!")
+        return [], [], []
+
+    # Get the collection from session state
+    collection = st.session_state.HW4_vectorDB["collection"]
+
     try:
+        # Generate query embeddings
         q_emb = openai_client.embeddings.create(input=query, model=EMBED_MODEL).data[0].embedding
+        # Perform the query on the collection
         res = collection.query(query_embeddings=[q_emb], n_results=k)
-    except TypeError:
-        res = collection.query(query_texts=[query], n_results=k)
+    except Exception as e:
+        st.error(f"Error querying Chroma collection: {e}")
+        return [], [], []
 
     docs = res.get("documents", [[]])[0] if res.get("documents") else []
     metas = res.get("metadatas", [[]])[0] if res.get("metadatas") else []
-    ids   = res.get("ids", [[]])[0] if res.get("ids") else []
+    ids = res.get("ids", [[]])[0] if res.get("ids") else []
+
     return docs, metas, ids
 
+# Base system prompt for the bot
 BASE_SYSTEM_PROMPT = (
     "You are a helpful iSchool assistant focused on student organizations, events, membership, "
     "leadership, and how to get involved. Prefer grounded answers from the provided HTML sources. "
@@ -224,29 +195,21 @@ BASE_SYSTEM_PROMPT = (
 )
 
 def build_rag_messages(user_q: str, ctx_docs: List[str], ctx_metas: List[Dict], memory_pairs: List[Dict]) -> List[Dict]:
-    """
-    Construct chat messages for the chosen LLM.
-
-    memory_pairs: last up to 5 Q&A items, each like:
-      {"q": "...", "a": "..."}
-    We inject them as an additional "system" message to give light conversational memory
-    without forcing the model to imitate verbatim past responses.
-    """
-    # Join top documents with simple separators and attributions
+    """Construct chat messages for the chosen LLM."""
     context_blobs = []
     for i, d in enumerate(ctx_docs):
-        fname = (ctx_metas[i].get("filename") if i < len(ctx_metas) else None) or f"doc_{i+1}"
-        # keep context bounded
-        snippet = d[:4000]
+        fname = ctx_metas[i].get("filename", f"doc_{i+1}")
+        snippet = d[:4000]  # Trim document if it's too long
         context_blobs.append(f"[SOURCE: {fname}]\n{snippet}")
+    
     context_text = "\n\n".join(context_blobs).strip()
 
-    # Build a lightweight memory context from prior 5 Q&A turns
+    # Add memory if available
     memory_text = ""
     if memory_pairs:
         lines = []
         for pair in memory_pairs[-5:]:
-            lines.append(f"Q: {pair.get('q','')}\nA: {pair.get('a','')}")
+            lines.append(f"Q: {pair['q']}\nA: {pair['a']}")
         memory_text = "\n\n".join(lines).strip()
 
     sys = {"role": "system", "content": BASE_SYSTEM_PROMPT}
@@ -258,9 +221,9 @@ def build_rag_messages(user_q: str, ctx_docs: List[str], ctx_metas: List[Dict], 
 
     if context_text:
         msgs.append({"role": "system", "content": f"Use the following context from iSchool HTML pages:\n\n{context_text}"})
-        msgs.append({"role": "user", "content": f"{user_q}\n\n(Answer with citations of the used HTML file names if possible.)"})
+        msgs.append({"role": "user", "content": f"{user_q}\n\n(Answer with citations from the HTML files.)"})
     else:
-        msgs.append({"role": "user", "content": f"{user_q}\n\n(No relevant HTML context retrieved; answer only if confident.)"})
+        msgs.append({"role": "user", "content": f"{user_q}\n\n(No relevant context retrieved; answer only if confident.)"})
 
     return msgs
 
@@ -278,12 +241,10 @@ def stream_completion(messages: List[Dict], model: str):
 with st.sidebar:
     model_choice = st.selectbox("Choose LLM", MODEL_CHOICES, index=0)
     top_k = st.slider("Retrieval: top-k chunks", 1, 5, 3)
-    st.caption("Tip: If you see sqlite errors on Cloud, this page already applies the pysqlite3 shim.")
 
 # =========================
 # Session state for memory buffer + messages
 # =========================
-# rolling buffer of last 5 Q&A (for memory)
 if "qa_memory" not in st.session_state:
     st.session_state.qa_memory = []  # list of {"q": str, "a": str}
 
