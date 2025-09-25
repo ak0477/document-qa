@@ -19,7 +19,7 @@ import chromadb
 # Configuration
 # =========================
 HTML_DIR = "/workspaces/document-qa/iSchool_HTMLs"  # Directory for your HTML files
-CHROMA_PATH = "./Chroma_HW4"  # Persistent vector store folder
+CHROMA_PATH = "/workspaces/document-qa/Chroma_HW4"  # Persistent vector store folder
 COLLECTION_NAME = "HW4_iSchool_StudentOrgs"
 EMBED_MODEL = "text-embedding-3-small"
 
