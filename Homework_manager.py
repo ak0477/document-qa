@@ -1,6 +1,7 @@
 import streamlit as st
 import requests, re, importlib.util
 from bs4 import BeautifulSoup
+import os, sys  # ✅ needed for file path + dynamic module loading
 
 # =========================
 # App config
@@ -529,28 +530,44 @@ def page_hw3():
         with st.expander("Response details"):
             st.json(meta)
 
-
 # =========================
 # Page: HW4 — iSchool Chatbot (RAG over HTML)
 # =========================
 def page_hw4():
     st.title("HW 4 — iSchool Chatbot (RAG over HTML)")
 
-    # Locate HW4.py relative to this app.py file
-    hw4_path = os.path.join(os.path.dirname(__file__), "HWs", "HW4.py")
+    hw4_path = os.path.join(os.path.dirname(__file__), "HW4.py")
     if not os.path.exists(hw4_path):
         st.error("HW4.py not found at ./HWs/HW4.py. Please add the file from your HW4 implementation.")
         return
 
-    # Import and execute HW4.py so its Streamlit code renders on this page
     try:
         spec = importlib.util.spec_from_file_location("hw4_module", hw4_path)
         hw4_mod = importlib.util.module_from_spec(spec)
         sys.modules["hw4_module"] = hw4_mod
         spec.loader.exec_module(hw4_mod)
-        # Note: If your HW4.py exposes a function like render(), you could call it here instead.
     except Exception as e:
         st.error("Failed to load HW4 page:")
+        st.exception(e)
+
+# =========================
+# NEW: Page: HW5 — Short-Term Memory Chatbot (RAG over HTML)
+# =========================
+def page_hw5():
+    st.title("HW 5 — Short-Term Memory Chatbot (RAG over HTML)")
+
+    hw5_path = os.path.join(os.path.dirname(__file__), "HW5.py")
+    if not os.path.exists(hw5_path):
+        st.error("HW5.py not found at ./HWs/HW5.py. Please add the file from your HW5 implementation.")
+        return
+
+    try:
+        spec = importlib.util.spec_from_file_location("hw5_module", hw5_path)
+        hw5_mod = importlib.util.module_from_spec(spec)
+        sys.modules["hw5_module"] = hw5_mod
+        spec.loader.exec_module(hw5_mod)
+    except Exception as e:
+        st.error("Failed to load HW5 page:")
         st.exception(e)
 
 # =========================
@@ -560,5 +577,7 @@ hw1_page = st.Page(page_hw1, title="HW 1 — Document Q&A", icon=":material/look
 hw2_page = st.Page(page_hw2, title="HW 2 — URL Summarizer", icon=":material/looks_two:")
 hw3_page = st.Page(page_hw3, title="HW 3 — URL Chatbot", icon=":material/looks_3:")
 hw4_page = st.Page(page_hw4, title="HW 4 — iSchool Chatbot", icon=":material/looks_4:")
-pg = st.navigation([hw1_page, hw2_page, hw3_page, hw4_page])
+hw5_page = st.Page(page_hw5, title="HW 5 — Short-Term Memory Chatbot", icon=":material/looks_5:")
+
+pg = st.navigation([hw1_page, hw2_page, hw3_page, hw4_page, hw5_page])
 pg.run()
