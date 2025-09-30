@@ -114,10 +114,18 @@ def chunk_text_into_two(text: str):
 # 1) Create/load Chroma once (reuse HW4 index)
 # =========================
 def create_or_load_vector_db():
-    """Create/load Chroma vector DB. Reuses HW4 index if already built."""
     need_build = (not os.path.exists(CHROMA_PATH)) or (os.path.exists(CHROMA_PATH) and not os.listdir(CHROMA_PATH))
+    try:
+        from chromadb.config import Settings
+        chroma_client = chromadb.PersistentClient(
+            path=CHROMA_PATH,
+            settings=Settings(anonymized_telemetry=False)
+        )
+    except Exception as e:
+        st.warning(f"Persistent Chroma unavailable ({e}). Falling back to in-memory.")
+        chroma_client = chromadb.EphemeralClient()
+        need_build = True  # must rebuild in-memory each run
 
-    chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
     collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
 
     count = collection.count()
