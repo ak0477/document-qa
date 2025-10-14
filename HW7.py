@@ -1,674 +1,392 @@
-import json
-import math
+"""
+HW7 — Human-Centered News Info Bot (Allowed Libs Only)
+=====================================================
+- Ingest a CSV of news stories (no pandas)
+- Answer:
+   • "find the most interesting news"
+   • "find news about <topic>"
+- RAG-style retrieval over CSV rows via Chroma
+- Transparent ranking with explanations
+- Works with or without an OpenAI key
+- Uses only: streamlit, openai, bs4 (optional), pysqlite3 shim, chromadb, stdlib
+
+Secrets (optional):
+Create /workspaces/document-qa/.streamlit/secrets.toml with:
+
+[openai]
+api_key = "sk-..."
+
+Quickstart:
+    streamlit run HW7.py
+"""
+
 import os
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import re
+import csv
+import sys
+import math
+from datetime import datetime, timezone, date
+from typing import List, Dict, Any, Optional, Tuple
 
-import anthropic
-import chromadb
-import numpy as np
-import pandas as pd
 import streamlit as st
-from openai import OpenAI
 
+# Optional OpenAI client (app runs without it)
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None  # type: ignore
 
-st.set_page_config(
-    page_title="HW7 — Legal News Intelligence Bot",
-    page_icon="🗞️",
-    layout="wide",
-)
+# Optional (not required, allowed by your sample)
+try:
+    from bs4 import BeautifulSoup  # noqa: F401
+except Exception:
+    BeautifulSoup = None  # type: ignore
 
+# --- Make Chroma use pysqlite3 (needed on Streamlit Cloud / Python 3.12) ---
+try:
+    import pysqlite3  # noqa: F401
+    sys.modules["sqlite3"] = pysqlite3
+    sys.modules["sqlite3.dbapi2"] = pysqlite3
+except Exception:
+    pass
 
-@dataclass
-class ModelChoice:
-    vendor: str
-    tier: str
-    model: str
-    label: str
-    is_budget: bool
+import chromadb
 
+# =========================
+# App Config
+# =========================
+st.set_page_config(page_title="HW7 — News Info Bot (Concise)", page_icon="📰", layout="wide")
 
-LAW_KEYWORD_WEIGHTS: Dict[str, float] = {
-    "litigation": 1.0,
-    "lawsuit": 1.0,
-    "regulator": 0.9,
-    "regulation": 0.9,
-    "merger": 0.85,
-    "acquisition": 0.85,
-    "antitrust": 1.0,
-    "sanction": 0.95,
-    "fine": 0.8,
-    "settlement": 0.9,
-    "compliance": 0.75,
-    "cybersecurity": 0.7,
-    "privacy": 0.7,
-    "intellectual property": 0.85,
-    "patent": 0.75,
-    "trade secret": 0.9,
-    "class action": 1.0,
-    "employment": 0.55,
-    "labor": 0.55,
-    "tax": 0.6,
-    "fraud": 0.9,
-    "governance": 0.6,
-    "esg": 0.5,
+DEFAULT_EMBED_MODEL = "text-embedding-3-small"
+VECTOR_PATH = os.path.join(os.getcwd(), ".newsbot_chroma")  # writable in Codespaces
+COLLECTION_NAME = "hw7_news_csv"
+
+# Suggested field names you can map to from your CSV
+DEFAULT_TEXT_FIELDS = ["title", "summary", "description", "content", "body", "snippet"]
+LEGAL_JURISDICTIONS = ["US", "EU", "UK", "CN", "IN", "JP", "CA", "AU", "BR"]
+
+# Human-centered weights for “interestingness”
+WEIGHTS = {"recency": 0.40, "relevance": 0.40, "authority": 0.10, "impact": 0.10}
+
+SOURCE_AUTHORITY = {
+    "Reuters": 0.95,
+    "Bloomberg": 0.90,
+    "Financial Times": 0.90,
+    "AP": 0.88,
+    "Wall Street Journal": 0.88,
 }
 
-PREFERRED_TEXT_COLUMNS: Sequence[str] = (
-    "title",
-    "headline",
-    "summary",
-    "description",
-    "content",
-    "body",
-)
-
-PREFERRED_META_COLUMNS: Sequence[str] = (
-    "topic",
-    "sector",
-    "industry",
-    "region",
-    "jurisdiction",
-    "source",
-)
-
-EMBED_MODEL = "text-embedding-3-small"
-
-MODEL_REGISTRY: List[ModelChoice] = [
-    ModelChoice("OpenAI", "budget", "gpt-4o-mini", "OpenAI gpt-4o-mini (fast, lower cost)", True),
-    ModelChoice("OpenAI", "premium", "gpt-4o", "OpenAI gpt-4o (enhanced reasoning)", False),
-    ModelChoice("Anthropic", "budget", "claude-3-haiku-20240307", "Anthropic Claude 3 Haiku (budget)", True),
-    ModelChoice("Anthropic", "premium", "claude-3-sonnet-20240229", "Anthropic Claude 3 Sonnet (premium)", False),
+IMPACT_KEYWORDS = [
+    "lawsuit", "litigation", "settlement", "fine", "regulator", "antitrust", "merger",
+    "acquisition", "DOJ", "FTC", "CMA", "EU", "GDPR", "privacy", "sanction", "ban", "compliance",
 ]
 
+# =========================
+# Helpers (secrets, dates, scoring)
+# =========================
 
-def get_model_options(vendor: Optional[str] = None) -> List[ModelChoice]:
-    if vendor:
-        return [m for m in MODEL_REGISTRY if m.vendor == vendor]
-    return list(MODEL_REGISTRY)
+def _secret(section: str, key: str) -> Optional[str]:
+    """Safe secrets getter: returns None if secrets.toml is missing."""
+    try:
+        sect = st.secrets.get(section)  # may raise if secrets not loaded
+        return (sect or {}).get(key) if isinstance(sect, dict) else None
+    except Exception:
+        return None
 
+def get_openai_client() -> Optional["OpenAI"]:
+    key = os.getenv("OPENAI_API_KEY") or _secret("openai", "api_key")
+    if not key or OpenAI is None:
+        return None
+    try:
+        return OpenAI(api_key=key)
+    except Exception:
+        return None
 
-def pick_model(vendor: str, tier: str) -> ModelChoice:
-    for entry in MODEL_REGISTRY:
-        if entry.vendor == vendor and entry.tier == tier:
-            return entry
-    raise ValueError(f"Unknown model selection for vendor={vendor}, tier={tier}")
-
-
-def get_api_keys() -> Tuple[Optional[str], Optional[str]]:
-    openai_key = (
-        st.secrets.get("openai", {}).get("api_key")
-        if st.secrets
-        else None
-    ) or os.getenv("OPENAI_API_KEY")
-    anthropic_key = (
-        st.secrets.get("anthropic", {}).get("api_key")
-        if st.secrets
-        else None
-    ) or os.getenv("ANTHROPIC_API_KEY")
-    return openai_key, anthropic_key
-
-
-OPENAI_KEY, ANTHROPIC_KEY = get_api_keys()
-
-if not OPENAI_KEY:
-    st.warning("OpenAI API key is required to embed the news collection and run the bot.")
-    st.stop()
-
-
-openai_client = OpenAI(api_key=OPENAI_KEY)
-anthropic_client: Optional[anthropic.Anthropic] = None
-if ANTHROPIC_KEY:
-    anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
-
-
-def read_news_csv(upload) -> pd.DataFrame:
-    df = pd.read_csv(upload)
-    df = df.replace({np.nan: None})
-    df.columns = [c.strip() for c in df.columns]
-    return df
-
-
-def concatenate_text(row: Dict[str, Any]) -> str:
-    sections: List[str] = []
-    for col in PREFERRED_TEXT_COLUMNS:
-        value = row.get(col)
-        if value and isinstance(value, str):
-            sections.append(f"{col.title()}: {value.strip()}")
-    if not sections:
-        fallback_parts = [str(v) for v in row.values() if isinstance(v, str)]
-        sections = fallback_parts[:3]
-    return "\n".join(sections).strip()
-
-
-def summarize_text_snippet(text: str, max_chars: int = 320) -> str:
-    if len(text) <= max_chars:
-        return text
-    return text[: max_chars - 3].strip() + "..."
-
-
-def compute_law_impact_score(text: str) -> float:
-    lowered = text.lower()
-    score = 0.0
-    for keyword, weight in LAW_KEYWORD_WEIGHTS.items():
-        if keyword in lowered:
-            score += weight
-    return score
-
-
-def extract_date(row: Dict[str, Any]) -> Optional[datetime]:
-    for candidate in ("date", "published", "publish_date", "time", "timestamp"):
-        value = row.get(candidate)
-        if not value:
-            continue
+def normalize_date(x: Any) -> Optional[datetime]:
+    if x is None:
+        return None
+    s = str(x).strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y", "%d-%b-%Y"):
         try:
-            parsed = pd.to_datetime(value, utc=True)
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
         except Exception:
             continue
-        if isinstance(parsed, pd.Series):
-            parsed = parsed.iloc[0]
-        if pd.isna(parsed):
-            continue
-        return parsed.to_pydatetime()
     return None
 
+def recency_score(d: Optional[datetime]) -> float:
+    if not d:
+        return 0.3
+    days = max(0.0, (datetime.now(timezone.utc) - d).total_seconds() / 86400.0)
+    return 1.0 / (1.0 + days / 7.0)  # ~weekly half-life
 
-def compute_recency_score(published_at: Optional[datetime]) -> float:
-    if not published_at:
+def authority_score(source: str) -> float:
+    if not source:
+        return 0.6
+    s = source.lower()
+    for k, v in SOURCE_AUTHORITY.items():
+        if k.lower() in s:
+            return v
+    return 0.6
+
+def impact_score(text: str) -> float:
+    tl = text.lower()
+    hits = sum(1 for kw in IMPACT_KEYWORDS if kw in tl)
+    return min(1.0, 0.25 + 0.15 * hits)
+
+def simple_relevance(text: str, query: str) -> float:
+    """Dependency-free relevance: token overlap ratio."""
+    if not query:
+        return 0.7
+    tq = [w for w in re.findall(r"\w+", query.lower()) if w]
+    if not tq:
+        return 0.7
+    tt = re.findall(r"\w+", text.lower())
+    if not tt:
         return 0.0
-    now = datetime.utcnow()
-    delta_days = max((now - published_at).days, 0)
-    return 1.0 / math.log(delta_days + 2.0)
+    qs, ts = set(tq), set(tt)
+    inter = len(qs.intersection(ts))
+    return min(1.0, inter / max(1, len(qs)))
 
+def interestingness(source: str, date_val: Optional[datetime], combined_text: str, query: str) -> Tuple[float, Dict[str, float]]:
+    r = recency_score(date_val)
+    a = authority_score(source or "")
+    imp = impact_score(combined_text or "")
+    rel = simple_relevance(combined_text or "", query or "")
+    total = WEIGHTS["recency"]*r + WEIGHTS["relevance"]*rel + WEIGHTS["authority"]*a + WEIGHTS["impact"]*imp
+    return float(total), {"recency": r, "relevance": rel, "authority": a, "impact": imp}
 
-def embed_texts(texts: Sequence[str]) -> List[List[float]]:
-    if not texts:
-        return []
-    response = openai_client.embeddings.create(input=list(texts), model=EMBED_MODEL)
-    return [record.embedding for record in response.data]
+# =========================
+# Chroma (vector store)
+# =========================
 
-
-def build_vector_store(df: pd.DataFrame):
-    client = chromadb.EphemeralClient()
-    collection = client.create_collection(
-        name="hw7_news",
-        metadata={"hnsw:space": "cosine"},
-    )
-
-    docs: List[str] = []
-    metadatas: List[Dict[str, Any]] = []
-    ids: List[str] = []
-
-    for row_index, row_series in df.iterrows():
-        row = row_series.to_dict()
-        document_text = concatenate_text(row)
-        if not document_text:
-            continue
-        summary = summarize_text_snippet(document_text)
-        published_at = extract_date(row)
-        law_score = compute_law_impact_score(document_text)
-        recency_score = compute_recency_score(published_at)
-        base_score = law_score * 0.7 + recency_score * 0.3
-        meta: Dict[str, Any] = {
-            "row_index": int(row_index),
-            "title": row.get("title") or row.get("headline") or summary.split("\n")[0],
-            "summary": summary,
-            "law_score": law_score,
-            "recency_score": recency_score,
-            "base_score": base_score,
-            "published_at": published_at.isoformat() if published_at else None,
-        }
-        for meta_col in PREFERRED_META_COLUMNS:
-            value = row.get(meta_col)
-            if value:
-                meta[meta_col] = value
-        meta["raw_row"] = row
-        meta["document_text"] = document_text
-
-        docs.append(document_text)
-        metadatas.append(meta)
-        ids.append(f"row-{row_index}")
-
-    embeddings = embed_texts(docs)
-    if embeddings:
-        collection.add(
-            documents=docs,
-            metadatas=metadatas,
-            embeddings=embeddings,
-            ids=ids,
-        )
-
-    return collection, metadatas
-
-
-def render_dataset_overview(df: pd.DataFrame):
-    st.markdown("### Uploaded news dataset")
-    st.caption("Only the first 1,000 rows are displayed for preview purposes.")
-    st.dataframe(df.head(1000))
-
-
-def format_candidate_entry(meta: Dict[str, Any]) -> str:
-    title = meta.get("title") or "Untitled"
-    source = meta.get("source")
-    topic = meta.get("topic") or meta.get("sector") or meta.get("industry")
-    published = meta.get("published_at")
-    summary = meta.get("summary") or "(summary unavailable)"
-    extras = []
-    if topic:
-        extras.append(f"Topic: {topic}")
-    if source:
-        extras.append(f"Source: {source}")
-    if published:
-        extras.append(f"Published: {published[:10]}")
-    extras.append(f"Law impact score: {meta.get('law_score', 0):.2f}")
-    extras.append(f"Recency score: {meta.get('recency_score', 0):.2f}")
-    extras_text = " | ".join(extras)
-    return f"{title}\n{extras_text}\nSummary: {summary}"
-
-
-def clean_json_output(text: str) -> Any:
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        chunks = cleaned.split("```")
-        if len(chunks) >= 2:
-            cleaned = chunks[1]
-    cleaned = cleaned.strip()
-    if cleaned.startswith("json"):
-        cleaned = cleaned[4:].strip()
+def ensure_chroma() -> chromadb.Client:
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        try:
-            return json.loads(cleaned.replace("'", '"'))
-        except json.JSONDecodeError:
-            return {"raw_output": text}
+        os.makedirs(VECTOR_PATH, exist_ok=True)
+        return chromadb.PersistentClient(path=VECTOR_PATH)
+    except Exception as e:
+        st.warning(f"Chroma storage unavailable ({e}); using in-memory index for this session.")
+        return chromadb.Client()  # ephemeral fallback
 
+def get_or_create_collection(client: chromadb.Client) -> chromadb.Collection:
+    return client.get_or_create_collection(name=COLLECTION_NAME)
 
-def call_openai_chat(model: str, system_prompt: str, user_prompt: str, temperature: float) -> str:
-    response = openai_client.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-    return response.choices[0].message.content or "{}"
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    cli = get_openai_client()
+    if not cli:
+        # Deterministic, tiny vectors so the app still runs without keys
+        embs: List[List[float]] = []
+        for t in texts:
+            seed = (hash(t) % 997) / 997.0
+            embs.append([((seed + i*0.03125) % 1.0) for i in range(32)])
+        return embs
+    resp = cli.embeddings.create(model=DEFAULT_EMBED_MODEL, input=texts)
+    return [d.embedding for d in resp.data]
 
+def _sanitize_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Chroma metadata must be Bool/Int/Float/Str/SparseVector (no None)."""
+    out: Dict[str, Any] = {}
+    for k, v in meta.items():
+        if v is None:
+            continue
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            continue
+        if isinstance(v, datetime):
+            out[k] = v.isoformat()
+        elif isinstance(v, (bool, int, float, str)):
+            out[k] = v
+        else:
+            out[k] = str(v)
+    return out
 
-def call_anthropic_chat(model: str, system_prompt: str, user_prompt: str, temperature: float) -> str:
-    if not anthropic_client:
-        raise RuntimeError("Anthropic API key unavailable")
-    response = anthropic_client.messages.create(
-        model=model,
-        max_tokens=1500,
-        temperature=temperature,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-    text_blocks = [block.text for block in response.content if block.type == "text"]
-    combined = "\n".join(text_blocks)
-    return combined
+def build_rag_from_rows(rows: List[Dict[str, Any]], text_fields: List[str]) -> chromadb.Collection:
+    client = ensure_chroma()
+    coll = get_or_create_collection(client)
+    # Clear & rebuild (simple for HW)
+    try:
+        ids_all = coll.get()["ids"]
+        if ids_all:
+            coll.delete(ids=ids_all)
+    except Exception:
+        pass
 
+    docs, ids, metas = [], [], []
+    for i, row in enumerate(rows):
+        parts: List[str] = []
+        for f in text_fields:
+            v = row.get(f)
+            if v is not None:
+                s = str(v).strip()
+                if s:
+                    parts.append(s)
+        if not parts:
+            continue
+        text = "\n\n".join(parts)
+        ids.append(f"row-{i}")
+        metas.append(_sanitize_meta(row))
+        docs.append(text)
 
-def generate_ranked_results(
-    task_description: str,
-    candidates: Sequence[Dict[str, Any]],
-    vendor: str,
-    model: str,
-    temperature: float,
-) -> Dict[str, Any]:
-    system_prompt = (
-        "You are a news intelligence analyst embedded in a global law firm. "
-        "Rank news for attorneys by considering potential legal risk, compliance impact, "
-        "deal flow, and client advisory opportunities. Always justify rankings using the facts provided. "
-        "Respond with a JSON object containing `ranked_items` (an array of objects with "
-        "fields id, title, reason, risk_level from 1-5, opportunity from 1-5) and "
-        "`analysis_summary` (a short paragraph)."
-    )
-    lines = [
-        "Evaluate the following candidate stories and fulfill the task described.",
-        f"Task: {task_description}",
-        "Candidates:",
+    if docs:
+        coll.add(documents=docs, metadatas=metas, ids=ids, embeddings=embed_texts(docs))
+    return coll
+
+def query_rag(coll: chromadb.Collection, query: str, k: int = 8) -> Dict[str, Any]:
+    cli = get_openai_client()
+    if cli:
+        q_emb = cli.embeddings.create(model=DEFAULT_EMBED_MODEL, input=query or "news").data[0].embedding
+        return coll.query(query_embeddings=[q_emb], n_results=k)
+
+    # Fallback: naive keyword relevance across stored documents
+    got = coll.get()
+    corpus = got["documents"]
+    metas = got["metadatas"]
+    scores: List[Tuple[int, float]] = []
+    for idx, doc in enumerate(corpus):
+        scores.append((idx, simple_relevance(doc, query or "news")))
+    scores.sort(key=lambda x: x[1], reverse=True)
+    top = scores[:k]
+    return {
+        "documents": [[corpus[i] for i, _ in top]],
+        "metadatas": [[metas[i] for i, _ in top]],
+        "ids": [[got["ids"][i] for i, _ in top]],
+    }
+
+# =========================
+# CSV loading (no pandas)
+# =========================
+
+def load_csv_to_rows(path: str) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append({k: v for k, v in r.items()})
+    return rows
+
+def read_uploaded_csv(uploaded_file) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    text = uploaded_file.read().decode("utf-8", errors="ignore")
+    uploaded_file.seek(0)
+    reader = csv.DictReader(text.splitlines())
+    for r in reader:
+        rows.append({k: v for k, v in r.items()})
+    return rows
+
+# =========================
+# Streamlit UI
+# =========================
+
+st.title("📰 HW7 — Human-Centered News Info Bot")
+st.caption("RAG over your CSV with transparent, human-centered ranking. (No extra libraries.)")
+
+with st.sidebar:
+    st.header("Setup")
+    uploaded = st.file_uploader("Upload news CSV", type=["csv"])
+
+    # Try a couple of default locations for a sample file
+    candidate_paths = [
+        "/mnt/data/Example_news_info_for_testing.csv",
+        os.path.join(os.getcwd(), "Example_news_info_for_testing.csv"),
     ]
-    for idx, meta in enumerate(candidates, start=1):
-        lines.append(
-            json.dumps(
-                {
-                    "candidate_id": f"{meta['row_index']}",
-                    "title": meta.get("title"),
-                    "summary": meta.get("summary"),
-                    "law_score": meta.get("law_score"),
-                    "recency_score": meta.get("recency_score"),
-                    "published_at": meta.get("published_at"),
-                    "topic": meta.get("topic") or meta.get("sector") or meta.get("industry"),
-                },
-                ensure_ascii=False,
-            )
-        )
-    user_prompt = "\n".join(lines)
+    default_path = next((p for p in candidate_paths if os.path.exists(p)), "")
+    use_example = st.toggle("Use built-in example CSV (if found)", value=bool(default_path) and not uploaded)
 
-    if vendor == "OpenAI":
-        raw = call_openai_chat(model, system_prompt, user_prompt, temperature)
-    elif vendor == "Anthropic":
-        raw = call_anthropic_chat(model, system_prompt, user_prompt, temperature)
-    else:
-        raise ValueError(f"Unsupported vendor: {vendor}")
+    st.subheader("Filters & Retrieval")
+    enable_jurisdiction_filter = st.checkbox("Enable jurisdiction filter", value=True)
+    allowed_juris = st.multiselect("Jurisdictions (if column exists)", LEGAL_JURISDICTIONS, default=["US", "EU", "UK"])
+    min_date = st.date_input("Min publish date (optional)")
+    top_k = st.slider("Top-k results", 3, 10, 6)
+    show_explain = st.checkbox("Show scoring breakdown", value=True)
 
-    parsed = clean_json_output(raw)
-    return parsed
+# Load rows
+if uploaded is not None:
+    data_rows = read_uploaded_csv(uploaded)
+elif use_example and default_path:
+    data_rows = load_csv_to_rows(default_path)
+else:
+    st.warning("Please upload a CSV (or place an example at one of the default paths).")
+    st.stop()
 
+if not data_rows:
+    st.error("CSV appears empty or unreadable.")
+    st.stop()
 
-def answer_question_with_rag(
-    question: str,
-    collection: chromadb.api.models.Collection.Collection,
-    vendor: str,
-    model: str,
-    temperature: float,
-) -> Dict[str, Any]:
-    n_results = min(6, max(collection.count(), 3))
-    query_response = collection.query(
-        query_texts=[question],
-        n_results=n_results,
-        include=["documents", "metadatas", "distances"],
-    )
-    metadatas = query_response.get("metadatas", [[]])[0]
-    documents = query_response.get("documents", [[]])[0]
+# Field mapping
+st.subheader("Map CSV Columns")
+all_cols = sorted(list({k for r in data_rows for k in r.keys()}))
+text_fields = st.multiselect(
+    "Text fields (used to search & rank)",
+    options=all_cols,
+    default=[c for c in all_cols if c and c.lower() in DEFAULT_TEXT_FIELDS][:2] or all_cols[:2],
+)
+url_field = st.selectbox("URL field (optional)", options=["<none>"] + all_cols, index=0)
+source_field = st.selectbox("Source field (optional)", options=["<none>"] + all_cols, index=0)
+date_field = st.selectbox("Date field (optional)", options=["<none>"] + all_cols, index=0)
+juris_field = st.selectbox("Jurisdiction/Region field (optional)", options=["<none>"] + all_cols, index=0)
 
-    context_lines = []
-    for meta, doc in zip(metadatas, documents):
-        context_lines.append(
-            json.dumps(
-                {
-                    "candidate_id": meta.get("row_index"),
-                    "title": meta.get("title"),
-                    "summary": meta.get("summary"),
-                    "document": summarize_text_snippet(doc, 420),
-                    "topic": meta.get("topic") or meta.get("sector") or meta.get("industry"),
-                    "published_at": meta.get("published_at"),
-                },
-                ensure_ascii=False,
-            )
-        )
+# Normalize row helpers
+for r in data_rows:
+    r["_date"] = normalize_date(r.get(date_field)) if (date_field != "<none>" and date_field in r) else None
+    r["_source"] = r.get(source_field, "") if source_field != "<none>" else ""
+    r["_url"] = r.get(url_field, "") if url_field != "<none>" else r.get("url", "")
+    r["_juris"] = r.get(juris_field, "") if juris_field != "<none>" else ""
 
-    system_prompt = (
-        "You answer attorney questions using the supplied news context. "
-        "Highlight legal risk, regulatory exposure, affected clients, and next steps. "
-        "If the answer is uncertain, say so. Provide citations using the candidate_id field." 
-    )
-    user_prompt = "\n".join(
-        [
-            f"Question: {question}",
-            "Context entries:",
-            *context_lines,
-            "Respond with a JSON object containing `answer` (markdown string) and "
-            "`used_items` (array of candidate_id strings).",
-        ]
-    )
+# Filters
+if enable_jurisdiction_filter and juris_field != "<none>":
+    data_rows = [r for r in data_rows if (r.get("_juris") in allowed_juris) or (not r.get("_juris"))]
+if isinstance(min_date, date):
+    data_rows = [r for r in data_rows if (r.get("_date") is None) or (r.get("_date").date() >= min_date)]
 
-    if vendor == "OpenAI":
-        raw = call_openai_chat(model, system_prompt, user_prompt, temperature)
-    elif vendor == "Anthropic":
-        raw = call_anthropic_chat(model, system_prompt, user_prompt, temperature)
-    else:
-        raise ValueError(f"Unsupported vendor: {vendor}")
+st.success(f"Loaded {len(data_rows):,} stories. Building vector index…")
+coll = build_rag_from_rows(data_rows, text_fields)
 
-    parsed = clean_json_output(raw)
-    parsed["retrieved_metadatas"] = metadatas
-    return parsed
+# Query
+st.subheader("Ask the bot")
+query_in = st.text_input("Try: 'find the most interesting news' or 'find news about <topic>'", value="find the most interesting news")
 
+if st.button("Search & Rank", type="primary"):
+    topical = "" if "most interesting" in query_in.lower() else query_in
 
-def describe_architecture():
-    st.markdown(
-        """
-        ### Architecture & Techniques
-        * **Vector RAG pipeline** – uploaded CSV rows are embedded with `text-embedding-3-small` and loaded into an in-memory Chroma collection. Metadata stores titles, summaries, law-impact heuristics, and recency information.
-        * **Domain heuristics** – before calling an LLM, the app scores every article with a lightweight legal-impact heuristic built from risk keywords and recency. This improves recall for law-firm-relevant items and keeps prompts focused.
-        * **LLM ranking layer** – for "most interesting" and topical rankings, shortlisted candidates are sent to the selected LLM (OpenAI or Anthropic) with instructions to output structured JSON containing rank, reasoning, and quantified risk/opportunity ratings.
-        * **Question answering** – free-form questions run a vector search over the collection, then the LLM generates an answer with citations to the candidate IDs used.
-        * **Model comparison workflow** – the sidebar lets you pick a *budget* and a *premium* model from two vendors. The comparison pane renders their rankings side-by-side to make evaluation straightforward.
-        """
-    )
+    # Candidate retrieval
+    res = query_rag(coll, topical or "news", k=top_k*3)
+    docs = res.get("documents", [[]])[0]
+    metas = res.get("metadatas", [[]])[0]
 
-    st.markdown(
-        """
-        ### Evaluation Strategy
-        * **Semantic spot-checks** – inspect the retrieved context snippets and the LLM's ranked rationales to ensure they align with the CSV data. Mismatches show up quickly because each response cites candidate IDs.
-        * **Heuristic baseline vs. LLM output** – the app exposes the heuristic base scores so you can confirm that the LLM is improving on (or at least not contradicting) the deterministic ranking.
-        * **A/B model comparison** – run the same task across the budget and premium models. Differences in ordering and rationale indicate sensitivity to reasoning depth. Consistency on high-signal stories builds confidence in the ranking quality.
-        * **Topic-specific regression** – use the "news about a topic" task with repeated keywords (e.g., antitrust, cybersecurity) to validate that targeted retrieval remains stable across runs.
-        """
-    )
+    results: List[Dict[str, Any]] = []
+    for doc, meta in zip(docs, metas):
+        date_val = meta.get("_date")  # may already be ISO; normalize if not
+        if isinstance(date_val, str):
+            date_val = normalize_date(date_val)
+        source = meta.get("_source", "")
+        score, parts = interestingness(source, date_val, doc, topical)
+        title = meta.get("title") or meta.get("headline") or (doc.split("\n")[0][:120] if doc else "Untitled")
+        url = meta.get("_url", "") or meta.get("url", "")
+        snippet = doc[:300] + ("…" if len(doc) > 300 else "")
+        results.append({"score": float(score), "parts": parts, "title": title, "url": url, "source": source, "snippet": snippet})
 
-    st.markdown(
-        """
-        ### Model Selection Guidance
-        * **OpenAI gpt-4o-mini** – lower cost, strong for rapid triage of large batches.
-        * **OpenAI gpt-4o** – higher reasoning ability for nuanced legal analysis (M&A, regulatory interpretation).
-        * **Anthropic Claude 3 Haiku** – fast baseline from a second vendor to diversify risk.
-        * **Anthropic Claude 3 Sonnet** – more expensive Anthropic option for deeper qualitative scoring.
-        """
-    )
+    ranked = sorted(results, key=lambda x: x["score"], reverse=True)[:top_k]
 
-
-def describe_testing_guidance():
-    st.markdown(
-        """
-        ### How to Validate Rankings
-        1. Run "Most interesting news" with the budget model and review whether the top stories carry the highest legal impact scores. Spot-check the raw summaries via the dataset table.
-        2. Switch to the premium model and re-run. If the order changes, read the rationale to verify whether deeper legal reasoning (e.g., multi-jurisdiction implications) justifies the change.
-        3. For topic-specific queries, verify that the surfaced IDs contain the keyword or related legal concepts within their text. Compare vendor outputs to ensure coverage parity.
-        4. Use the cited candidate IDs to trace back to the CSV rows; discrepancies reveal gaps in either the heuristic shortlist or the LLM explanation.
-        """
-    )
-
-
-def render_comparison(results: Dict[str, Any], header: str):
-    ranked_items = results.get("ranked_items", [])
-    if not ranked_items:
-        st.info("No ranked items returned.")
-        return
-    for idx, item in enumerate(ranked_items, start=1):
-        with st.container():
-            st.markdown(
-                f"**{idx}. {item.get('title', 'Untitled')}** — Risk {item.get('risk_level', 'N/A')} | "
-                f"Opportunity {item.get('opportunity', 'N/A')}"
-            )
-            st.markdown(item.get("reason", "(no explanation)"))
-            st.caption(f"Candidate ID: {item.get('id')} | {header}")
-
-
-def render_answer(answer_payload: Dict[str, Any]):
-    st.markdown(answer_payload.get("answer", "(no answer)"))
-    used_items = answer_payload.get("used_items", [])
-    if used_items:
-        st.caption(f"Cited candidate IDs: {', '.join(str(item) for item in used_items)}")
-
-
-def main():
-    st.title("HW7 — Legal News Intelligence Bot")
-    st.caption(
-        "Upload a CSV of news stories and triage them for a global law firm using RAG, ranking, and LLM comparisons."
-    )
-
-    available_vendors = sorted({choice.vendor for choice in MODEL_REGISTRY})
-    with st.sidebar:
-        st.header("Model configuration")
-        primary_vendor = st.selectbox("Primary vendor", options=available_vendors)
-        primary_tier = st.radio(
-            "Primary model tier",
-            options=["budget", "premium"],
-            index=0,
-            key="primary-tier",
-        )
-        secondary_vendor = st.selectbox(
-            "Comparison vendor",
-            options=[v for v in available_vendors if v != primary_vendor] or available_vendors,
-            index=1 if len(available_vendors) > 1 else 0,
-        )
-        secondary_tier = st.radio(
-            "Comparison tier",
-            options=["budget", "premium"],
-            index=1,
-            key="secondary-tier",
-        )
-        temperature = st.slider("LLM temperature", min_value=0.0, max_value=1.0, value=0.2, step=0.1)
-
-    if secondary_vendor == primary_vendor and secondary_tier == primary_tier:
-        st.sidebar.warning("Select a different vendor or tier for comparison to satisfy the assignment requirement.")
-
-    primary_choice = pick_model(primary_vendor, primary_tier)
-    comparison_choice = pick_model(secondary_vendor, secondary_tier)
-
-    if primary_choice.vendor == "Anthropic" and not anthropic_client:
-        st.sidebar.error("Anthropic API key missing. Provide it via Streamlit secrets or environment variables.")
-    if comparison_choice.vendor == "Anthropic" and not anthropic_client:
-        st.sidebar.error("Anthropic API key missing. Provide it via Streamlit secrets or environment variables.")
-
-    st.markdown("### Step 1: Upload a CSV of news stories")
-    uploaded_file = st.file_uploader("Upload CSV", type=["csv"], accept_multiple_files=False)
-
-    if not uploaded_file:
-        st.info(
-            "The CSV should include columns such as `title`, `summary`, `content`, `topic`, and `date`. "
-            "You can export these from any news scraping workflow."
-        )
-        describe_architecture()
-        describe_testing_guidance()
-        return
-
-    df = read_news_csv(uploaded_file)
-    if df.empty:
-        st.error("Uploaded CSV is empty or could not be parsed.")
-        return
-
-    collection, metadatas = build_vector_store(df)
-    st.success(f"Loaded {len(metadatas)} stories into the vector index.")
-    render_dataset_overview(df)
-
-    st.markdown("### Step 2: Choose an action")
-    task = st.radio(
-        "Select task",
-        options=[
-            "Most interesting news",
-            "News about a specific topic",
-            "Ask a custom question",
-        ],
-    )
-
-    base_candidates = sorted(metadatas, key=lambda m: m.get("base_score", 0), reverse=True)
-    top_candidates = base_candidates[: min(12, len(base_candidates))]
-
-    if task == "Most interesting news":
-        st.markdown(
-            "Most interesting = stories with high legal risk/opportunity, recent developments, or strategic relevance for law-firm clients."
-        )
-        if st.button("Rank stories"):
-            with st.spinner(f"Ranking with {primary_choice.label}..."):
-                primary_results = generate_ranked_results(
-                    "Identify the most legally significant stories to brief the partnership.",
-                    top_candidates,
-                    primary_choice.vendor,
-                    primary_choice.model,
-                    temperature,
-                )
-            with st.spinner(f"Ranking with {comparison_choice.label}..."):
-                comparison_results = generate_ranked_results(
-                    "Identify the most legally significant stories to brief the partnership.",
-                    top_candidates,
-                    comparison_choice.vendor,
-                    comparison_choice.model,
-                    temperature,
+    st.markdown("### Ranked Results")
+    for i, r in enumerate(ranked, start=1):
+        with st.container(border=True):
+            st.markdown(f"**{i}. {r['title']}**")
+            if r["url"]:
+                st.markdown(f"[Open story]({r['url']})  |  Source: _{r['source'] or 'N/A'}_")
+            else:
+                st.markdown(f"Source: _{r['source'] or 'N/A'}_")
+            st.write(r["snippet"])
+            if show_explain:
+                st.caption(
+                    f"Why ranked → recency: {r['parts']['recency']:.2f}, "
+                    f"relevance: {r['parts']['relevance']:.2f}, "
+                    f"authority: {r['parts']['authority']:.2f}, "
+                    f"impact: {r['parts']['impact']:.2f}  (weights {WEIGHTS})"
                 )
 
-            col1, col2 = st.columns(2)
-            with col1:
-                st.subheader(f"Primary model — {primary_choice.label}")
-                render_comparison(primary_results, header=primary_choice.label)
-            with col2:
-                st.subheader(f"Comparison model — {comparison_choice.label}")
-                render_comparison(comparison_results, header=comparison_choice.label)
-
-            st.markdown("#### Model analyses")
-            st.markdown("**Primary model summary:**")
-            st.markdown(primary_results.get("analysis_summary", "(none)"))
-            st.markdown("**Comparison model summary:**")
-            st.markdown(comparison_results.get("analysis_summary", "(none)"))
-
-    elif task == "News about a specific topic":
-        topic_query = st.text_input("Enter a topic, sector, client, or jurisdiction", value="antitrust")
-        if st.button("Find topic-specific stories") and topic_query:
-            topical_candidates = sorted(
-                metadatas,
-                key=lambda m: (topic_query.lower() in (m.get("summary") or "").lower(), m.get("base_score", 0)),
-                reverse=True,
-            )[: min(12, len(metadatas))]
-
-            with st.spinner(f"Ranking topic matches with {primary_choice.label}..."):
-                primary_results = generate_ranked_results(
-                    f"Rank the stories most relevant to the topic: {topic_query}.",
-                    topical_candidates,
-                    primary_choice.vendor,
-                    primary_choice.model,
-                    temperature,
-                )
-            with st.spinner(f"Ranking topic matches with {comparison_choice.label}..."):
-                comparison_results = generate_ranked_results(
-                    f"Rank the stories most relevant to the topic: {topic_query}.",
-                    topical_candidates,
-                    comparison_choice.vendor,
-                    comparison_choice.model,
-                    temperature,
-                )
-
-            col1, col2 = st.columns(2)
-            with col1:
-                st.subheader(f"Primary model — {primary_choice.label}")
-                render_comparison(primary_results, header=primary_choice.label)
-            with col2:
-                st.subheader(f"Comparison model — {comparison_choice.label}")
-                render_comparison(comparison_results, header=comparison_choice.label)
-
-            st.markdown("#### Topic analysis summaries")
-            st.markdown("**Primary model summary:**")
-            st.markdown(primary_results.get("analysis_summary", "(none)"))
-            st.markdown("**Comparison model summary:**")
-            st.markdown(comparison_results.get("analysis_summary", "(none)"))
-
-    elif task == "Ask a custom question":
-        question = st.text_input("Enter your question about the news", value="Which stories pose the biggest compliance risk this week?")
-        if st.button("Answer question") and question:
-            with st.spinner(f"Answering with {primary_choice.label}..."):
-                answer_payload = answer_question_with_rag(
-                    question,
-                    collection,
-                    primary_choice.vendor,
-                    primary_choice.model,
-                    temperature,
-                )
-            st.subheader(f"Answer from {primary_choice.label}")
-            render_answer(answer_payload)
-
-            comparison_disabled = comparison_choice.vendor == primary_choice.vendor and comparison_choice.model == primary_choice.model
-            if not comparison_disabled:
-                with st.spinner(f"Answering with {comparison_choice.label}..."):
-                    comparison_answer = answer_question_with_rag(
-                        question,
-                        collection,
-                        comparison_choice.vendor,
-                        comparison_choice.model,
-                        temperature,
-                    )
-                st.subheader(f"Answer from {comparison_choice.label}")
-                render_answer(comparison_answer)
-
-    st.markdown("---")
-    describe_architecture()
-    describe_testing_guidance()
-
-
-if __name__ == "__main__":
-    main()
-
+st.divider()
+st.markdown("#### Notes")
+st.write(
+    "This concise build uses only your allowed libraries. It provides RAG over CSV with transparent ranking and "
+    "jurisdiction/date filters. If no OpenAI key is set, the app uses deterministic fallback vectors so it still runs."
+)
