@@ -1,25 +1,3 @@
-"""
-HW7 — Human-Centered News Info Bot (Allowed Libs Only)
-=====================================================
-- Ingest a CSV of news stories (no pandas)
-- Answer:
-   • "find the most interesting news"
-   • "find news about <topic>"
-- RAG-style retrieval over CSV rows via Chroma
-- Transparent ranking with explanations
-- Works with or without an OpenAI key
-- Uses only: streamlit, openai, bs4 (optional), pysqlite3 shim, chromadb, stdlib
-
-Secrets (optional):
-Create /workspaces/document-qa/.streamlit/secrets.toml with:
-
-[openai]
-api_key = "sk-..."
-
-Quickstart:
-    streamlit run HW7.py
-"""
-
 import os
 import re
 import csv
