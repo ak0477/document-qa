@@ -571,6 +571,26 @@ def page_hw5():
         st.exception(e)
 
 # =========================
+# NEW: Page: HW7 — Legal News Bot
+# =========================
+def page_hw7():
+    st.title("HW 7 — Legal News Bot")
+
+    hw7_path = os.path.join(os.path.dirname(__file__), "HW7.py")
+    if not os.path.exists(hw7_path):
+        st.error("HW7.py not found at ./HW7.py. Please add the file from your HW7 implementation.")
+        return
+
+    try:
+        spec = importlib.util.spec_from_file_location("hw7_module", hw7_path)
+        hw7_mod = importlib.util.module_from_spec(spec)
+        sys.modules["hw7_module"] = hw7_mod
+        spec.loader.exec_module(hw7_mod)
+    except Exception as e:
+        st.error("Failed to load HW7 page:")
+        st.exception(e)
+
+# =========================
 # Navigation
 # =========================
 hw1_page = st.Page(page_hw1, title="HW 1 — Document Q&A", icon=":material/looks_one:")
@@ -578,6 +598,7 @@ hw2_page = st.Page(page_hw2, title="HW 2 — URL Summarizer", icon=":material/lo
 hw3_page = st.Page(page_hw3, title="HW 3 — URL Chatbot", icon=":material/looks_3:")
 hw4_page = st.Page(page_hw4, title="HW 4 — iSchool Chatbot", icon=":material/looks_4:")
 hw5_page = st.Page(page_hw5, title="HW 5 — Short-Term Memory Chatbot", icon=":material/looks_5:")
+hw7_page = st.Page(page_hw7, title="HW 7 — Legal News Bot", icon=":material/looks_6:")
 
-pg = st.navigation([hw1_page, hw2_page, hw3_page, hw4_page, hw5_page])
+pg = st.navigation([hw1_page, hw2_page, hw3_page, hw4_page, hw5_page, hw7_page])
 pg.run()
