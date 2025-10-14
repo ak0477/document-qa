@@ -11,3 +11,5 @@ python-dotenv>=1.0.1
 chromadb>=0.5.4
 duckdb>=0.10.0
 lxml
+pandas>=2.2.2
+numpy>=1.26
